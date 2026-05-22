@@ -1,0 +1,106 @@
+services:
+  valkey:
+    image: valkey/valkey:7.2-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - valkey-data:/data
+    command: valkey-server --appendonly yes --appendfsync everysec --save 60 1 --loglevel warning
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  project_manager:
+    build:
+      context: .
+      dockerfile: agents/project_manager/Dockerfile
+    environment:
+      VALKEY_URL: valkey://valkey:6379
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY}
+      PM_MODEL: ${PM_MODEL:-mistral-large-latest}
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+      GH_ORG: ${GH_ORG:-}
+    depends_on:
+      valkey:
+        condition: service_healthy
+    restart: unless-stopped
+
+  researcher:
+    build:
+      context: .
+      dockerfile: agents/researcher/Dockerfile
+    environment:
+      VALKEY_URL: valkey://valkey:6379
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY}
+      RESEARCHER_MODEL: ${RESEARCHER_MODEL:-mistral-medium-latest}
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+      GH_ORG: ${GH_ORG:-}
+    depends_on:
+      valkey:
+        condition: service_healthy
+    restart: unless-stopped
+
+  engineer:
+    build:
+      context: .
+      dockerfile: agents/engineer/Dockerfile
+    environment:
+      VALKEY_URL: valkey://valkey:6379
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY}
+      ENGINEER_MODEL: ${ENGINEER_MODEL:-devstral-latest}
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+      GH_ORG: ${GH_ORG:-}
+    depends_on:
+      valkey:
+        condition: service_healthy
+    restart: unless-stopped
+
+  qa:
+    build:
+      context: .
+      dockerfile: agents/qa/Dockerfile
+    environment:
+      VALKEY_URL: valkey://valkey:6379
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY}
+      QA_MODEL: ${QA_MODEL:-devstral-latest}
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+      GH_ORG: ${GH_ORG:-}
+    depends_on:
+      valkey:
+        condition: service_healthy
+    restart: unless-stopped
+
+  infra:
+    build:
+      context: .
+      dockerfile: agents/infra/Dockerfile
+    environment:
+      VALKEY_URL: valkey://valkey:6379
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY}
+      INFRA_MODEL: ${INFRA_MODEL:-mistral-medium-latest}
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+      GH_ORG: ${GH_ORG:-}
+    depends_on:
+      valkey:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: agents/frontend/Dockerfile
+    environment:
+      VALKEY_URL: valkey://valkey:6379
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY}
+      FRONTEND_MODEL: ${FRONTEND_MODEL:-devstral-latest}
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+      GH_ORG: ${GH_ORG:-}
+    depends_on:
+      valkey:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  valkey-data:

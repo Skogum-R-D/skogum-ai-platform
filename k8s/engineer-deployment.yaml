@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: engineer
+  labels:
+    app: engineer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: engineer
+  template:
+    metadata:
+      labels:
+        app: engineer
+    spec:
+      containers:
+        - name: engineer
+          image: skogum/engineer:latest
+          env:
+            - name: VALKEY_URL
+              value: "valkey://valkey:6379"
+            - name: MISTRAL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: mistral-secret
+                  key: api-key
+            - name: ENGINEER_MODEL
+              value: "devstral-latest"
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-secret
+                  key: token
+            - name: GH_ORG
+              valueFrom:
+                secretKeyRef:
+                  name: github-secret
+                  key: org
+                  optional: true
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import valkey; valkey.from_url('valkey://valkey:6379').ping()"
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
