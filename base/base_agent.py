@@ -2,8 +2,16 @@ import asyncio
 import json
 import logging
 import os
+from contextlib import AsyncExitStack
 from datetime import datetime, timezone
 from typing import Any
+
+try:
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+    _MCP_AVAILABLE = True
+except ImportError:
+    _MCP_AVAILABLE = False
 
 import valkey.asyncio as aio_valkey
 from mistralai.client import Mistral
@@ -44,6 +52,9 @@ class BaseAgent:
         self._tool_fns: dict[str, callable] = {}
         self._tool_schemas: list = []  # mistralai.client.models.Tool objects
         self.MAX_TOOL_ITERATIONS = 10  # override in subclasses that need more headroom
+
+        # MCP session lifecycle — AsyncExitStacks keep stdio connections alive
+        self._mcp_exit_stacks: list[AsyncExitStack] = []
 
     # ── Event bus ──────────────────────────────────────────────────────────────
 
@@ -228,6 +239,74 @@ class BaseAgent:
         )
         self.logger.debug("Registered tool: %s", name)
 
+    async def connect_mcp_server(
+        self,
+        command: str,
+        args: list[str],
+        env: dict[str, str] | None = None,
+        prefix: str = "",
+    ) -> None:
+        """Spawn an MCP server process, fetch its tools, and register them.
+
+        Tools are available to the Mistral tool loop immediately after this call.
+        The connection stays open for the lifetime of the agent; all sessions are
+        closed automatically when run() exits.
+
+        Args:
+            command: Executable to run (e.g. "npx", "python", "uvx").
+            args:    Arguments to the executable (e.g. ["-y", "@modelcontextprotocol/server-github"]).
+            env:     Extra environment variables for the server process.
+            prefix:  Prepended to every tool name as "{prefix}__{tool_name}" to
+                     avoid collisions when multiple MCP servers are connected.
+        """
+        if not _MCP_AVAILABLE:
+            self.logger.warning("mcp package not installed — cannot connect MCP server: %s", command)
+            return
+
+        merged_env = {**os.environ, **(env or {})}
+        server_params = StdioServerParameters(command=command, args=args, env=merged_env)
+
+        stack = AsyncExitStack()
+        try:
+            read, write = await stack.enter_async_context(stdio_client(server_params))
+            session: ClientSession = await stack.enter_async_context(ClientSession(read, write))
+            await session.initialize()
+        except Exception as exc:
+            await stack.aclose()
+            self.logger.error("Failed to connect MCP server %s: %s", command, exc)
+            return
+
+        tools_result = await session.list_tools()
+        registered = []
+        for tool in tools_result.tools:
+            tool_name = f"{prefix}__{tool.name}" if prefix else tool.name
+            schema = {
+                "name": tool_name,
+                "description": tool.description or "",
+                "parameters": tool.inputSchema or {"type": "object", "properties": {}},
+            }
+
+            def _make_caller(orig_name: str, sess: "ClientSession"):
+                async def caller(**kwargs):
+                    result = await sess.call_tool(orig_name, kwargs)
+                    parts = []
+                    for item in result.content:
+                        if hasattr(item, "text"):
+                            parts.append(item.text)
+                        else:
+                            parts.append(str(item))
+                    return {"result": "\n".join(parts)}
+                return caller
+
+            self.register_tool(tool_name, _make_caller(tool.name, session), schema)
+            registered.append(tool_name)
+
+        self._mcp_exit_stacks.append(stack)
+        self.logger.info(
+            "MCP server connected: %s %s → %d tools: %s",
+            command, " ".join(args[:2]), len(registered), registered,
+        )
+
     async def _pre_tool_args_hook(self, name: str, args: dict) -> dict:
         """Override in subclasses to modify tool arguments before execution."""
         return args
@@ -248,7 +327,11 @@ class BaseAgent:
         else:
             self.logger.info("Tool call: %s(%s)", name, str(args)[:120])
             try:
-                raw = await asyncio.to_thread(fn, **args)
+                # MCP callers are coroutines; native tools are blocking — handle both
+                if asyncio.iscoroutinefunction(fn):
+                    raw = await fn(**args)
+                else:
+                    raw = await asyncio.to_thread(fn, **args)
                 result = raw if isinstance(raw, (dict, list)) else {"result": raw}
             except Exception as exc:
                 self.logger.exception("Tool %s raised: %s", name, exc)
@@ -318,6 +401,20 @@ class BaseAgent:
 
     # ── Hooks (override in subclasses) ─────────────────────────────────────────
 
+    async def startup(self) -> None:
+        """Called once before the event loop starts.
+
+        Override to connect MCP servers or do any async initialisation:
+
+            async def startup(self):
+                await self.connect_mcp_server(
+                    command="npx",
+                    args=["-y", "@modelcontextprotocol/server-github"],
+                    env={"GITHUB_TOKEN": os.getenv("GITHUB_TOKEN", "")},
+                    prefix="github",
+                )
+        """
+
     async def handle_event(self, event: dict) -> None:
         self.logger.warning("Unhandled event type: %s", event.get("type"))
 
@@ -330,10 +427,18 @@ class BaseAgent:
 
     async def run(self) -> None:
         self.logger.info("Agent %r starting (model=%s)", self.agent_name, self.model)
-        await asyncio.gather(
-            self.listen_events(),
-            self.listen_discussions(),
-        )
+        await self.startup()
+        try:
+            await asyncio.gather(
+                self.listen_events(),
+                self.listen_discussions(),
+            )
+        finally:
+            for stack in reversed(self._mcp_exit_stacks):
+                try:
+                    await stack.aclose()
+                except Exception:
+                    pass
 
 
 def _now() -> str:
