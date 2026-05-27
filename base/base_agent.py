@@ -404,16 +404,37 @@ class BaseAgent:
     async def startup(self) -> None:
         """Called once before the event loop starts.
 
-        Override to connect MCP servers or do any async initialisation:
+        Reads MCP_SERVERS from the environment and connects each server.
+        Override in subclasses for hardcoded servers, but call super().startup()
+        first so the env-driven servers are always loaded:
 
             async def startup(self):
-                await self.connect_mcp_server(
-                    command="npx",
-                    args=["-y", "@modelcontextprotocol/server-github"],
-                    env={"GITHUB_TOKEN": os.getenv("GITHUB_TOKEN", "")},
-                    prefix="github",
-                )
+                await super().startup()
+                await self.connect_mcp_server(command="uvx", args=["my-server"], prefix="x")
+
+        MCP_SERVERS format (JSON array in the environment variable):
+
+            MCP_SERVERS=[
+              {"prefix": "fetch", "command": "uvx", "args": ["mcp-server-fetch"]},
+              {"prefix": "gh",    "command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"],
+               "env": {"GITHUB_TOKEN": "..."}}
+            ]
         """
+        raw = os.getenv("MCP_SERVERS", "").strip()
+        if not raw:
+            return
+        try:
+            configs = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            self.logger.error("MCP_SERVERS is not valid JSON — skipping: %s", exc)
+            return
+        for cfg in configs:
+            await self.connect_mcp_server(
+                command=cfg["command"],
+                args=cfg.get("args", []),
+                env=cfg.get("env"),
+                prefix=cfg.get("prefix", ""),
+            )
 
     async def handle_event(self, event: dict) -> None:
         self.logger.warning("Unhandled event type: %s", event.get("type"))
